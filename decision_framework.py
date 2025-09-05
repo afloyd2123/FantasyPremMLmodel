@@ -1,153 +1,133 @@
+# decision_framework.py
+import os
 import pandas as pd
 import numpy as np
-import os
 from sklearn.linear_model import LinearRegression
-from config import ERROR_METRICS_PATH, WEIGHTS_LOG_PATH, MERGED_GW_PATH, USE_MANUAL_WEIGHTS, MANUAL_WEIGHTS
+from config import MERGED_GW_PATH, USE_MANUAL_WEIGHTS, MANUAL_WEIGHTS
 
-TRADE_THRESHOLD = 3
-
-# =======================
-# Optimal Weight Learning
-# =======================
-
-def get_optimal_weights(predictions_df, current_gw):
-    if USE_MANUAL_WEIGHTS:
-        print("⚙️ Using manual override weights from config.")
-        return MANUAL_WEIGHTS["ict"], MANUAL_WEIGHTS["valuation"], MANUAL_WEIGHTS["opponent"]
-
+def get_optimal_weights(predictions_df: pd.DataFrame, current_gw: int):
+    """Compute optimal ensemble weights by regressing predictions against actuals."""
+    # Load actuals
     actuals_df = pd.read_csv(MERGED_GW_PATH)
-    merged = pd.merge(predictions_df, actuals_df, left_on='id', right_on='element')
 
-    df = merged.dropna(subset=[
-        "ict_prediction", "valuation_prediction", "opponent_prediction", "total_points"
-    ])
+    # Normalize gameweek column
+    gw_col = None
+    for c in ["gw", "GW", "round", "event"]:
+        if c in actuals_df.columns:
+            gw_col = c
+            break
+    if gw_col is None:
+        raise KeyError("No gameweek column found in merged_gw.csv")
 
-    if df.empty:
-        print("⚠️ Not enough data to optimize weights. Using equal weights.")
-        return 1/3, 1/3, 1/3
+    # Filter actuals
+    if "total_points" not in actuals_df.columns:
+        raise KeyError("'total_points' not found in merged_gw.csv")
+    actuals_df = actuals_df[[gw_col, "element", "total_points"]]
+    actuals_df = actuals_df[actuals_df[gw_col] == current_gw]
 
-    X = df[["ict_prediction", "valuation_prediction", "opponent_prediction"]]
-    y = df["total_points"]
+    # Ensure predictions_df has an 'id' for merging
+    if "id" not in predictions_df.columns:
+        if "element" in predictions_df.columns:
+            predictions_df = predictions_df.rename(columns={"element": "id"})
+        elif "name" in predictions_df.columns:
+            predictions_df["id"] = predictions_df["name"]
+        else:
+            raise KeyError("predictions_df has no 'id', 'element', or 'name' column to merge on.")
 
-    model = LinearRegression()
-    model.fit(X, y)
-    weights = model.coef_
-
-    log_weights(weights, current_gw)
-
-    return weights[0], weights[1], weights[2]
-
-
-
-def log_weights(weights, gw):
-    row = {
-        "gw": gw,
-        "ict_weight": round(weights[0], 3),
-        "valuation_weight": round(weights[1], 3),
-        "opponent_weight": round(weights[2], 3)
-    }
-
-    df = pd.DataFrame([row])
-    if os.path.exists(WEIGHTS_LOG_PATH):
-        df.to_csv(WEIGHTS_LOG_PATH, mode='a', index=False, header=False)
-    else:
-        df.to_csv(WEIGHTS_LOG_PATH, index=False)
-
-
-def compute_composite_score(df, w_ict, w_val, w_opp):
-    return (
-        w_ict * df["ict_prediction"] +
-        w_val * df["valuation_prediction"] +
-        w_opp * df["opponent_prediction"]
+    # Merge predictions with actuals
+    merged = pd.merge(
+        predictions_df,
+        actuals_df,
+        left_on="id",
+        right_on="element",
+        how="inner"
     )
 
+    # Normalize total_points column
+    if "total_points_y" in merged.columns:
+        merged = merged.rename(columns={"total_points_y": "total_points"})
+    elif "total_points_x" in merged.columns:
+        merged = merged.rename(columns={"total_points_x": "total_points"})
 
-# ===================
-# Decision Logic Core
-# ===================
+    if "total_points" not in merged.columns:
+        raise KeyError(
+            f"Merge failed to bring in total_points. Columns present: {merged.columns.tolist()}"
+        )
 
-def make_decisions(predictions_df, current_gw, team_status):
-    decisions = {}
+    # Drop rows with missing values in required columns
+    df = merged.dropna(
+        subset=["ict_prediction", "valuation_prediction", "opponent_prediction", "total_points"]
+    )
 
-    # Optimize and compute composite score
-    w_ict, w_val, w_opp = get_optimal_weights(predictions_df, current_gw)
-    predictions_df["composite_score"] = compute_composite_score(predictions_df, w_ict, w_val, w_opp)
+    if df.empty:
+        print("⚠️ Not enough data to optimize weights, falling back to equal weights.")
+        return (1/3, 1/3, 1/3)
 
-    # Trade decisions
-    decisions['trade_ins'] = predictions_df.nlargest(5, 'composite_score')[['id', 'name']].to_dict('records')
-    decisions['trade_outs'] = predictions_df.nsmallest(5, 'composite_score')[['id', 'name']].to_dict('records')
+    # Fit regression for weights
+    X = df[["ict_prediction", "valuation_prediction", "opponent_prediction"]].values
+    y = df["total_points"].values
 
-    # Captain decisions
-    top_captains = predictions_df.nlargest(2, 'composite_score')[['id', 'name']]
-    decisions['captain'] = top_captains.iloc[0].to_dict()
-    decisions['vice_captain'] = top_captains.iloc[1].to_dict()
+    try:
+        reg = LinearRegression(positive=True)
+        reg.fit(X, y)
+        w_ict, w_val, w_opp = reg.coef_
+        total = w_ict + w_val + w_opp
+        if total == 0:
+            return (1/3, 1/3, 1/3)
+        return (w_ict / total, w_val / total, w_opp / total)
+    except Exception as e:
+        print(f"⚠️ Weight optimization failed: {e}, falling back to equal weights.")
+        return (1/3, 1/3, 1/3)
+
+
+def make_decisions(features: pd.DataFrame, current_gw: int, team_status: dict):
+    """Generate strategic FPL decisions based on model predictions and optimal weights."""
+    predictions_df = features.copy()
+
+    # 🔧 Ensure predictions_df has an 'id'
+    if "id" not in predictions_df.columns:
+        if "element" in predictions_df.columns:
+            predictions_df = predictions_df.rename(columns={"element": "id"})
+        elif "name" in predictions_df.columns:
+            predictions_df["id"] = predictions_df["name"]
+
+    if USE_MANUAL_WEIGHTS:
+        w_ict = MANUAL_WEIGHTS["ict"]
+        w_val = MANUAL_WEIGHTS["valuation"]
+        w_opp = MANUAL_WEIGHTS["opponent"]
+        print(f"ℹ️ Using manual weights: {MANUAL_WEIGHTS}")
+    else:
+        w_ict, w_val, w_opp = get_optimal_weights(predictions_df, current_gw)
+        print(f"📊 Optimized weights → ICT={w_ict:.2f}, VAL={w_val:.2f}, OPP={w_opp:.2f}")
+
+    # Ensemble score
+    predictions_df["ensemble_score"] = (
+        w_ict * predictions_df["ict_prediction"] +
+        w_val * predictions_df["valuation_prediction"] +
+        w_opp * predictions_df["opponent_prediction"]
+    )
+
+    # Pick captain and vice
+    top_players = predictions_df.sort_values("ensemble_score", ascending=False)
+    captain = top_players.iloc[0]
+    vice_captain = top_players.iloc[1]
+
+    # Simple transfers
+    trade_ins = top_players.head(3)[["id", "name", "ensemble_score"]].to_dict("records")
+    trade_outs = top_players.tail(3)[["id", "name", "ensemble_score"]].to_dict("records")
 
     # Chip logic
-    high_scorers = predictions_df[predictions_df['ict_prediction'] > 6].shape[0]
-    decisions['chip'] = 'Bench Boost' if high_scorers > 11 else 'None'
+    chip = "None"
+    if team_status.get("triple_captain_available") and current_gw in [2, 19, 34]:
+        chip = "Triple Captain"
+    elif team_status.get("bench_boost_available") and current_gw in [19, 34]:
+        chip = "Bench Boost"
 
-    if current_gw > 30:
-        if team_status.get('bench_boost_available'):
-            decisions['chip'] = 'Bench Boost'
-        elif team_status.get('triple_captain_available'):
-            decisions['chip'] = 'Triple Captain'
+    return {
+        "trade_ins": trade_ins,
+        "trade_outs": trade_outs,
+        "captain": {"id": captain["id"], "name": captain["name"]},
+        "vice_captain": {"id": vice_captain["id"], "name": vice_captain["name"]},
+        "chip": chip
+    }
 
-    return decisions
-
-
-# ===================
-# Trade Validation
-# ===================
-
-def is_valid_trade(user_team, player_in, player_out):
-    temp_team = [p for p in user_team if p['id'] != player_out['id']]
-    temp_team.append(player_in)
-
-    gk = sum(1 for p in temp_team if p['position'] == 'GKP')
-    df = sum(1 for p in temp_team if p['position'] == 'DEF')
-    md = sum(1 for p in temp_team if p['position'] == 'MID')
-    fw = sum(1 for p in temp_team if p['position'] == 'FWD')
-
-    return gk == 2 and df == 5 and md == 5 and fw == 3
-
-
-def is_within_club_limit(user_team, player_in, max_per_club=3):
-    club_count = sum(1 for p in user_team if p['club'] == player_in['club'])
-    return club_count < max_per_club
-
-
-def is_double_gw(gw, fixtures_df):
-    count = fixtures_df[fixtures_df['gw'] == gw]['team'].value_counts()
-    return any(count > 1)
-
-
-def is_difficult_gw(gw, fixtures_df, top_teams):
-    gw_fixtures = fixtures_df[fixtures_df['gw'] == gw]
-    tough_matches = gw_fixtures[
-        (gw_fixtures['team'].isin(top_teams)) &
-        (gw_fixtures['opponent_team'].isin(top_teams))
-    ]
-    return len(tough_matches) > len(top_teams) * 0.5
-
-
-def select_best_trade(user_team, candidates_in, candidates_out, budget, model_predictions):
-    best_gain = 0
-    best_trade = (None, None)
-
-    for _, player_in in candidates_in.iterrows():
-        for _, player_out in candidates_out.iterrows():
-            gain = (
-                model_predictions.loc[player_in['id'], 'predicted_points'] -
-                model_predictions.loc[player_out['id'], 'predicted_points']
-            )
-
-            if (
-                gain > best_gain and
-                player_in['cost'] <= player_out['cost'] + budget and
-                is_valid_trade(user_team, player_in.to_dict(), player_out.to_dict()) and
-                is_within_club_limit(user_team, player_in.to_dict())
-            ):
-                best_gain = gain
-                best_trade = (player_in.to_dict(), player_out.to_dict())
-
-    return best_trade

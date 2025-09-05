@@ -9,12 +9,12 @@ SEASON = "2025-26"  # Change this once to test a different season
 # 📁 Data repository path (from Vaastav GitHub)
 REPO_DIR = os.path.join(BASE_DIR, "Fantasy-Premier-League")
 DATA_DIR = os.path.join(REPO_DIR, "data", SEASON)
-
+GWS_DIR = os.path.join(DATA_DIR, "gws")
 # 📄 Common data files
-MERGED_GW_PATH = os.path.join(DATA_DIR, "merged_gw.csv")
+MERGED_GW_PATH = os.path.join(GWS_DIR, "merged_gw.csv")
 CLEANED_PLAYERS_PATH = os.path.join(DATA_DIR, "cleaned_players.csv")
 
-USER_TEAM_PATH = os.path.join(BASE_DIR, "user_team.xlsx")
+#USER_TEAM_PATH = os.path.join(BASE_DIR, "user_team.xlsx")
 USER_PERFORMANCE_PATH = os.path.join(BASE_DIR, "user_performance.xlsx")
 
 WEIGHTS_LOG_PATH = os.path.join(BASE_DIR, "weights_log.csv")
@@ -35,7 +35,7 @@ OPPONENT_MODEL_PATH = os.path.join(BASE_DIR, "opponent_model.pkl")
 USER_TEAM_PATH = os.path.join(BASE_DIR, "user_team.xlsx")
 USER_PERFORMANCE_PATH = os.path.join(BASE_DIR, "user_performance.xlsx")
 PLAYER_IDLIST_PATH = os.path.join(DATA_DIR, "player_idlist.csv")
-MERGED_GW_PATH = os.path.join(DATA_DIR, "merged_gw.csv")
+#MERGED_GW_PATH = os.path.join(DATA_DIR, "merged_gw.csv")
 
 
 # 📄 Output logs
