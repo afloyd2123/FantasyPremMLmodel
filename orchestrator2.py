@@ -121,9 +121,71 @@ def run_fpl_pipeline():
     #log_error_metrics(current_gw, merged)
 
     print("✅ Pipeline completed successfully.")
+    print("🎯 Decisions:")
+    print(f"CAPTAIN: {decisions['captain']['name']} "
+        f"(proj gap vs vice: {decisions['captain']['confidence_gap']:.2f} pts)")
+    print(f"VICE:    {decisions['vice_captain']['name']}")
+    print(f"CHIP:    {decisions['chip']}")
 
-# keep your existing log_recommendations / log_error_metrics as-is
+    if decisions["trade_ins"]:
+        print("🔄 Suggested Trades:")
+        for out, inn in zip(decisions["trade_outs"], decisions["trade_ins"]):
+            gain = inn["projected_points"] - out["projected_points"]
+            print(f"  - {out['name']} ➝ {inn['name']} (+{gain:.1f} pts over next 5 GWs)")
+    else:
+        print("🔄 No trades suggested.")
+
+    print(f"💰 Bank before: {decisions['bank_before']:.1f}m | after: {decisions['bank_after']:.1f}m")
+    print(f"🎟️ Free transfers before: {decisions['free_transfers_before']} | after: {decisions['free_transfers_after']}")
+    print(f"📊 Squad Value: {decisions['squad_value']:.1f}m")
+    print(f"📈 Projected gain from trades: {decisions['trade_gain']:.1f} pts")
+
+    if decisions["injury_flags"]:
+        print("🩺 Injuries/flags:", decisions["injury_flags"])
+
+    if decisions["fixture_info"]:
+        print("📅 Fixture Horizon (next 5 GWs):")
+        print("   Easier runs:", ", ".join(decisions["fixture_info"]["easiest_runs"]))
+        print("   Harder runs:", ", ".join(decisions["fixture_info"]["hardest_runs"]))
+
+    log_decisions(current_gw, decisions)
+    print(f"📝 Decisions for GW{current_gw} logged to history_decisions.csv")
+
+
+# ---- Logger defined below ----
+import csv
+from pathlib import Path
+
+HISTORY_LOG = Path(BASE_DIR) / "history_decisions.csv"
+
+def log_decisions(current_gw, decisions):
+    file_exists = HISTORY_LOG.exists()
+    with open(HISTORY_LOG, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "gw", "captain", "vice_captain", "chip",
+            "trade_outs", "trade_ins",
+            "bank_before", "bank_after",
+            "free_transfers_before", "free_transfers_after",
+            "trade_gain", "squad_value"
+        ])
+        if not file_exists:
+            writer.writeheader()
+
+        writer.writerow({
+            "gw": current_gw,
+            "captain": decisions["captain"]["name"],
+            "vice_captain": decisions["vice_captain"]["name"],
+            "chip": decisions["chip"],
+            "trade_outs": ", ".join([p["name"] for p in decisions["trade_outs"]]) if decisions["trade_outs"] else "",
+            "trade_ins": ", ".join([p["name"] for p in decisions["trade_ins"]]) if decisions["trade_ins"] else "",
+            "bank_before": decisions["bank_before"],
+            "bank_after": decisions["bank_after"],
+            "free_transfers_before": decisions["free_transfers_before"],
+            "free_transfers_after": decisions["free_transfers_after"],
+            "trade_gain": decisions["trade_gain"],
+            "squad_value": decisions["squad_value"],
+        })
+
+
 if __name__ == "__main__":
     run_fpl_pipeline()
-
-
