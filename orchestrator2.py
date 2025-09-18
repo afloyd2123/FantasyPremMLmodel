@@ -150,6 +150,9 @@ def run_fpl_pipeline():
 
     log_decisions(current_gw, decisions)
     print(f"📝 Decisions for GW{current_gw} logged to history_decisions.csv")
+    
+    if decisions["injury_flags"]["count"] > 0:
+        print(f"🩺 Injured players: {', '.join(decisions['injury_flags']['players'])}")
 
 
 # ---- Logger defined below ----

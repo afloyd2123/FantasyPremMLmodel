@@ -93,76 +93,88 @@ def get_optimal_weights(predictions_df: pd.DataFrame, current_gw: int):
         return (1 / 3, 1 / 3, 1 / 3)
 
 def optimize_trades(predictions_df, user_team, position_lookup, cost_lookup,
-                    current_gw, lookahead=5, bank=0.0, free_transfers=1):
-
+                    current_gw, lookahead=5, bank=0.0, free_transfers=1,
+                    injured_ids=None):
     """
     Suggest optimal trades over a multi-week horizon.
-    - predictions_df: DataFrame with ensemble_score + gw info
-    - user_team: DataFrame from user_team.xlsx
-    - position_lookup: dict {id: position}
-    - cost_lookup: dict {id: cost}
-    - current_gw: current gameweek
-    - lookahead: number of future GWs to consider (default 5)
+    Ensures trades are position-aligned (DEF->DEF, MID->MID, etc).
     """
+
+    if injured_ids is None:
+        injured_ids = []
+
     squad_ids = set(user_team["id"].tolist())
     starting_ids = set(user_team.loc[user_team["Starting"], "id"].tolist())
 
+    # Separate squad vs pool
     in_squad = predictions_df[predictions_df["id"].isin(squad_ids)].copy()
     out_squad = predictions_df[~predictions_df["id"].isin(squad_ids)].copy()
 
-    # --- Project over multiple GWs ---
-    max_gw = predictions_df["GW"].max() if "GW" in predictions_df.columns else current_gw
-    end_gw = min(current_gw + lookahead - 1, max_gw)
-
-    # Filter to relevant window
-    window = predictions_df[(predictions_df["GW"] >= current_gw) & (predictions_df["GW"] <= end_gw)]
-
-    def project_points(player_id):
-        df = window[window["id"] == player_id]
-        return df["ensemble_score"].sum() if not df.empty else 0
-
-    # Baseline: projected team score with current XI
-    baseline_score = sum(project_points(pid) for pid in starting_ids)
+    # Add position info
+    in_squad["position"] = in_squad["id"].map(position_lookup)
+    out_squad["position"] = out_squad["id"].map(position_lookup)
 
     trade_outs, trade_ins = [], []
-    free_transfers = 2 if user_team.get("saved_transfer", False) else 1
-    max_trades = free_transfers
+    baseline_score = in_squad["ensemble_score"].sum()
+    bank_after = bank
+    free_after = free_transfers
 
-    # Consider all starters as possible trade-outs
-    for pid_out in starting_ids:
-        pos = position_lookup.get(pid_out, None)
-        if not pos:
-            continue
+    # Candidates to replace: injured first, then lowest scores
+    candidates_out = in_squad[in_squad["id"].isin(injured_ids)].copy()
+    if candidates_out.empty:
+        candidates_out = in_squad.sort_values("ensemble_score").head(3)
 
-        candidates = out_squad[out_squad["position"] == pos]
-        if candidates.empty:
-            continue
-
-        # Best candidate for this position
-        best_in = candidates.sort_values("ensemble_score", ascending=False).iloc[0]
-        pid_in = best_in["id"]
-
-        # Projected scores
-        out_score = project_points(pid_out)
-        in_score = project_points(pid_in)
-
-        improvement = in_score - out_score
-        threshold = max(1.0, 0.1 * out_score)  # adaptive threshold
-
-        # Budget check
-        current_cost = sum(cost_lookup.get(pid, 0) for pid in squad_ids)
+    for _, player_out in candidates_out.iterrows():
+        pid_out = player_out["id"]
+        pos_out = player_out["position"]
         cost_out = cost_lookup.get(pid_out, 0)
+        proj_out = player_out["ensemble_score"]
+
+        # Enforce position match
+        candidates_in = out_squad[out_squad["position"] == pos_out].copy()
+        if candidates_in.empty:
+            continue
+
+        # Check affordability
+        candidates_in["affordable"] = candidates_in["id"].map(cost_lookup).fillna(0) <= (cost_out + bank)
+        candidates_in = candidates_in[candidates_in["affordable"]]
+
+        if candidates_in.empty:
+            continue
+
+        # Pick best projected points
+        best_in = candidates_in.sort_values("ensemble_score", ascending=False).iloc[0]
+        pid_in = best_in["id"]
+        proj_in = best_in["ensemble_score"]
         cost_in = cost_lookup.get(pid_in, 0)
-        new_total = current_cost - cost_out + cost_in
 
-        if improvement > threshold and within_budget([new_total]):
-            trade_outs.append({"id": pid_out, "name": best_in.get("name", "Unknown"), "projected_points": out_score})
-            trade_ins.append({"id": pid_in, "name": best_in["name"], "projected_points": in_score})
+        if proj_in > proj_out:  # Only if it improves
+            trade_outs.append({
+                "id": pid_out,
+                "name": player_out.get("name", str(pid_out)),
+                "projected_points": proj_out,
+                "now_cost": cost_out,
+                "position": pos_out,
+            })
+            trade_ins.append({
+                "id": pid_in,
+                "name": best_in.get("name", str(pid_in)),
+                "projected_points": proj_in,
+                "now_cost": cost_in,
+                "position": pos_out,
+            })
 
-        if len(trade_outs) >= max_trades:
-            break
+            # Update budget + free transfers
+            bank_after += cost_out - cost_in
+            free_after = max(0, free_after - 1)
 
-    return trade_outs, trade_ins, baseline_score
+            # Stop once we hit the limit
+            if len(trade_outs) >= free_transfers:
+                break
+
+    trade_gain = sum(t["projected_points"] for t in trade_ins) - sum(t["projected_points"] for t in trade_outs)
+
+    return trade_outs, trade_ins, bank_after, free_transfers, trade_gain
 
 
 # ---------- Squad Optimization ----------
@@ -245,10 +257,21 @@ def pick_best_starting_xi(predictions_df: pd.DataFrame, position_lookup: dict):
     return starters_df
 
 # ---------- Decision Engine ----------
+from config import PLAYER_IDLIST_PATH, CLEANED_PLAYERS_PATH, USE_MANUAL_WEIGHTS, MANUAL_WEIGHTS, MERGED_GW_PATH
+
+def _element_to_position(et):
+    try:
+        et = int(et)
+    except Exception:
+        return "UNK"
+    return {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}.get(et, "UNK")
+
 def make_decisions(features: pd.DataFrame, current_gw: int, team_status: dict):
     """
     Generate FPL decisions based on model predictions, user team, and rules.
-    Returns squad, trades, captaincy, chip usage, and helpful summary statistics.
+    - Uses ensemble of ICT, Valuation, Opponent models.
+    - Picks captain/vice from starting XI in user_team.xlsx.
+    - Suggests trades using optimize_trades().
     """
     predictions_df = features.copy()
 
@@ -260,36 +283,71 @@ def make_decisions(features: pd.DataFrame, current_gw: int, team_status: dict):
 
     # Load current team
     user_team = read_current_team()
-    if "Bank" not in user_team.columns or "Free Transfers" not in user_team.columns:
-        raise KeyError("user_team.xlsx must include 'Bank' and 'Free Transfers' columns.")
 
-    bank_value = float(user_team["Bank"].iloc[0])   # e.g. 0.2
-    free_transfers = int(user_team["Free Transfers"].iloc[0])
-
-    if "Starting" in user_team.columns:
-        user_team["Starting"] = user_team["Starting"].astype(str).str.upper().eq("TRUE")
-    else:
+    if "Bank" not in user_team.columns:
+        raise KeyError("user_team.xlsx must include a 'Bank' column")
+    if "Free Transfers" not in user_team.columns:
+        raise KeyError("user_team.xlsx must include a 'Free Transfers' column")
+    if "Starting" not in user_team.columns:
         raise KeyError("user_team.xlsx must include a 'Starting' column with TRUE/FALSE values.")
 
-    squad_ids = set(user_team["id"].tolist())
+    bank_value = float(user_team["Bank"].iloc[0])
+    free_transfers = int(user_team["Free Transfers"].iloc[0])
+    user_team["Starting"] = user_team["Starting"].astype(str).str.upper().eq("TRUE")
 
-    # --- Position + Cost lookup ---
-    idlist_df = pd.read_csv(PLAYER_IDLIST_PATH)
-    players_df = pd.read_csv(CLEANED_PLAYERS_PATH)
-    idlist_df["name"] = idlist_df["first_name"] + " " + idlist_df["second_name"]
-    players_df["name"] = players_df["first_name"] + " " + players_df["second_name"]
-    merged = idlist_df.merge(players_df, how="left", on="name")
+    # Optional Injured
+    if "Injured" in user_team.columns:
+        user_team["Injured"] = user_team["Injured"].astype(str).str.upper().eq("TRUE")
+    else:
+        user_team["Injured"] = False
+
+    squad_ids = set(user_team["id"].dropna().astype(int).tolist())
+    starting_ids = set(user_team.loc[user_team["Starting"], "id"].dropna().astype(int).tolist())
+    injured_ids = set(user_team.loc[user_team["Injured"], "id"].dropna().astype(int).tolist())
+
+        # --- POSITIONS + COST LOOKUP ---
+    idlist_df = pd.read_csv(PLAYER_IDLIST_PATH, encoding="latin1")
+    players_df = pd.read_csv(CLEANED_PLAYERS_PATH, encoding="latin1")
+
+    # Prefer joining on ID if both have it
+    if "id" in idlist_df.columns and "id" in players_df.columns:
+        merged = idlist_df.merge(
+            players_df[["id", "element_type", "now_cost"]],
+            on="id",
+            how="left"
+        )
+    else:
+        # Fallback: normalize and join on name
+        for df in [idlist_df, players_df]:
+            for col in ["first_name", "second_name"]:
+                if col in df.columns:
+                    df[col] = (
+                        df[col]
+                        .astype(str)
+                        .str.normalize("NFKD")
+                        .str.encode("ascii", errors="ignore")
+                        .str.decode("utf-8")
+                    )
+            if "first_name" in df.columns and "second_name" in df.columns:
+                df["name"] = df["first_name"].str.strip() + " " + df["second_name"].str.strip()
+
+        merged = idlist_df.merge(
+            players_df[["name", "element_type", "now_cost"]],
+            on="name",
+            how="left"
+        )
+
+    # Build lookups
+    element_map = merged.set_index("id")["element_type"].dropna().to_dict()
+    cost_lookup = merged.set_index("id")["now_cost"].dropna().to_dict()
+    position_lookup = {pid: _element_to_position(et) for pid, et in element_map.items()}
 
     def element_to_position(et: int) -> str:
         return {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}.get(et, "UNK")
 
-    if "element_type" in merged.columns:
-        element_map = merged.set_index("id")["element_type"].to_dict()
-        position_lookup = {pid: element_to_position(et) for pid, et in element_map.items()}
-    else:
-        position_lookup = {pid: "UNK" for pid in merged["id"]}
-
-    cost_lookup = merged.set_index("id")["now_cost"].to_dict() if "now_cost" in merged.columns else {}
+    element_map = merged.set_index("id")["element_type"].to_dict()
+    position_lookup = {pid: element_to_position(et) for pid, et in element_map.items()}
+    cost_lookup = merged.set_index("id")["now_cost"].to_dict()
 
     # --- Ensemble scoring ---
     if USE_MANUAL_WEIGHTS:
@@ -313,21 +371,20 @@ def make_decisions(features: pd.DataFrame, current_gw: int, team_status: dict):
     in_squad = predictions_df[predictions_df["id"].isin(squad_ids)].copy()
     in_squad["position"] = in_squad["id"].map(position_lookup)
 
-    starting_ids = set(user_team.loc[user_team["Starting"], "id"].tolist())
     starting_xi = in_squad[in_squad["id"].isin(starting_ids)]
     bench = in_squad[~in_squad["id"].isin(starting_ids)]
 
     if starting_xi.empty:
         raise ValueError("No starters found — check 'Starting' column in user_team.xlsx.")
 
-    # Captain & Vice
+    # Captain & Vice = top two projected from starters
     starting_sorted = starting_xi.sort_values("ensemble_score", ascending=False)
     captain = starting_sorted.iloc[0]
     vice_captain = starting_sorted.iloc[1] if len(starting_sorted) > 1 else captain
     captain_confidence = captain["ensemble_score"] - vice_captain["ensemble_score"]
 
-    # --- Optimize Trades (multi-week) ---
-    trade_outs, trade_ins, baseline_score = optimize_trades(
+    # --- Optimize Trades ---
+    trade_outs, trade_ins, bank_after_m, free_after, trade_gain = optimize_trades(
         predictions_df,
         user_team,
         position_lookup,
@@ -336,51 +393,10 @@ def make_decisions(features: pd.DataFrame, current_gw: int, team_status: dict):
         lookahead=5,
         bank=bank_value,
         free_transfers=free_transfers,
+        injured_ids=injured_ids
     )
 
-    # Projected gain from trades
-    trade_gain = 0
-    if trade_outs and trade_ins:
-        trade_gain = sum(t["projected_points"] for t in trade_ins) - sum(t["projected_points"] for t in trade_outs)
-
-    # Bank + transfers after trades
-    total_squad_cost = sum(cost_lookup.get(pid, 0) for pid in squad_ids)
-    if trade_outs and trade_ins:
-        cost_out = sum(cost_lookup.get(t["id"], 0) for t in trade_outs)
-        cost_in = sum(cost_lookup.get(t["id"], 0) for t in trade_ins)
-        new_total = total_squad_cost - cost_out + cost_in
-        new_bank = (1000 + bank_value * 10 - new_total) / 10.0
-    else:
-        new_bank = bank_value
-    new_free_transfers = max(0, free_transfers - len(trade_outs))
-
-    # Squad value
-    squad_value = total_squad_cost / 10.0
-
-    # Injury / Risk summary
-    injury_flags = {}
-    for col in ["red_cards", "yellow_cards"]:
-        if col in in_squad.columns:
-            injury_flags[col] = int(in_squad[col].sum())
-
-    # Fixture horizon (easy vs hard runs for YOUR squad only)
-    fixture_info = {}
-    if "opponent_difficulty" in predictions_df.columns:
-        horizon = predictions_df[
-            (predictions_df["GW"] >= current_gw) & (predictions_df["GW"] < current_gw + 5)
-        ]
-        horizon = horizon[horizon["id"].isin(squad_ids)]  # ✅ restrict to your team only
-
-    if not horizon.empty:
-        avg_difficulty = horizon.groupby("id")["opponent_difficulty"].mean()
-        easiest = avg_difficulty.nsmallest(min(3, len(avg_difficulty))).index.tolist()
-        hardest = avg_difficulty.nlargest(min(3, len(avg_difficulty))).index.tolist()
-        fixture_info = {
-            "easiest_runs": [id_to_name.get(pid, str(pid)) for pid in easiest],
-            "hardest_runs": [id_to_name.get(pid, str(pid)) for pid in hardest],
-        }
-
-    # Chip logic
+    # --- Chip logic ---
     chip = "None"
     if team_status.get("triple_captain_available") and current_gw in [2, 19, 34]:
         chip = "Triple Captain"
@@ -390,18 +406,24 @@ def make_decisions(features: pd.DataFrame, current_gw: int, team_status: dict):
     return {
         "trade_ins": trade_ins,
         "trade_outs": trade_outs,
-        "trade_gain": trade_gain,
         "captain": {"id": captain["id"], "name": captain["name"], "confidence_gap": captain_confidence},
         "vice_captain": {"id": vice_captain["id"], "name": vice_captain["name"]},
         "chip": chip,
         "starting_xi": starting_sorted[["id", "name", "position", "ensemble_score"]].to_dict("records"),
         "bench": bench[["id", "name", "position", "ensemble_score"]].to_dict("records"),
-        "baseline_score_next5": baseline_score,
         "bank_before": bank_value,
-        "bank_after": new_bank,
+        "bank_after": bank_after_m,
         "free_transfers_before": free_transfers,
-        "free_transfers_after": new_free_transfers,
-        "squad_value": squad_value,
-        "injury_flags": injury_flags,
-        "fixture_info": fixture_info,
+        "free_transfers_after": free_after,
+        "squad_value": sum(cost_lookup.get(pid, 0) for pid in squad_ids) / 10.0,
+        "trade_gain": trade_gain,
+        "injury_flags": {
+            "players": [id_to_name.get(pid, str(pid)) for pid in user_team.loc[user_team["Injured"], "id"]],
+            "count": int(user_team["Injured"].sum())
+        },
+        "fixture_info": {
+            "easiest_runs": [],   # placeholder until fixture difficulty is calculated
+            "hardest_runs": []
+}
+
     }
