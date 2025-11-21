@@ -13,6 +13,7 @@ GWS_DIR = os.path.join(DATA_DIR, "gws")
 # 📄 Common data files
 MERGED_GW_PATH = os.path.join(GWS_DIR, "merged_gw.csv")
 CLEANED_PLAYERS_PATH = os.path.join(DATA_DIR, "cleaned_players.csv")
+LINEUP_HISTORY_PATH = os.path.join(BASE_DIR, "history_lineups.csv")
 
 #USER_TEAM_PATH = os.path.join(BASE_DIR, "user_team.xlsx")
 USER_PERFORMANCE_PATH = os.path.join(BASE_DIR, "user_performance.xlsx")
